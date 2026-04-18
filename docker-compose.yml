@@ -1,0 +1,9 @@
+services:
+  dota-bot:
+    build: .
+    container_name: dota-fleet
+    restart: unless-stopped
+    volumes:
+      - ./stats.json:/app/stats.json
+      - ./bot.log:/app/bot.log
+      - ./params.json:/app/params.json

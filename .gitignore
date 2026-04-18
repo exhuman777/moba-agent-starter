@@ -1,0 +1,8 @@
+stats.json
+config.json
+bots.json
+bot.log
+q_table.json
+policy_model.json
+__pycache__/
+*.pyc
