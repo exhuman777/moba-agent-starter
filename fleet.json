@@ -1,5 +1,5 @@
 {
   "game": 3,
-  "notes": "starter config. register your bots with: python3 bot.py --register YourName --class mage",
+  "notes": "Empty starter. Run `python3 register.py` to populate.",
   "bots": []
 }

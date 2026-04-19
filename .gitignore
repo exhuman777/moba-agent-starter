@@ -1,8 +1,16 @@
+# secrets
+wallet.key
+.env
+
+# runtime state (per-machine)
 stats.json
-config.json
-bots.json
+ws_runner.log
 bot.log
-q_table.json
-policy_model.json
+fleet.archive-*.json
+stats.archive-*.json
+
+# editor / OS
+.DS_Store
+.claude/
 __pycache__/
 *.pyc
