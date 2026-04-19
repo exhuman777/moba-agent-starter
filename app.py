@@ -19,8 +19,11 @@ from rich.table import Table
 from rich.console import Group
 
 import quant
-from brain import LearningBrain
-from rl_engine import RLBrain, RewardCalculator
+# brain and rl_engine available but not used in bot logic (complexity hurt WR)
+# keeping imports for dashboard RL Training tab display only
+try:
+    from rl_engine import RewardCalculator
+except: RewardCalculator = None
 
 BASE = "https://wc2-agentic-dev-3o6un.ondigitalocean.app"
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -115,9 +118,7 @@ class Bot:
         self.last_action=""; self.kills_est=0; self.deaths=0; self.recalls=0
         self.decisions=0; self.errors=0
         self._prev_alive=True; self._prev_xp=0; self._lane_tick=0; self._prev_hero=None
-        self.brain=None; self.rl=None
         self.strategy_override=None
-        self.target=cfg.get("target")  # counter target (e.g. "lmeow")
 
     def find_hero(self, s):
         for h in s.get("heroes",[]):
@@ -136,153 +137,53 @@ class Bot:
         return choices[0]
 
     def pick_lane(self, state, hero, all_bots):
-        """ZEN MODE: Pick best lane ONCE at game start, STAY FOREVER.
-        ExH_Mage2 (unmanaged, never switches) hits L14. Our managed bots hit L7.
-        Every lane switch = 216 XP lost. Solution: stop switching.
-        Only move for: manual override, 1v4+ extreme danger, last 90s endgame.
-        RL still learns passively (data collection) for future improvements.
+        """PURE ZEN: use assigned lane from fleet.json. never switch.
+        data shows every dynamic lane picker caused stacking or shove.
+        lmeow stays mid every game. we stay in assigned lane every game.
+        only exception: manual override (keys 1-6) and last 60s endgame.
         """
         so=self.strategy_override
         if so and so.startswith("converge:"): return so.split(":")[1]
         if so in LANES: return so
 
-        faction=self.faction or ""; enemy="orc" if faction=="human" else "human"
+        # ENDGAME: last 60s, group for final push
         tick=state.get("tick",0)
-        lane_enemies={l:self._count(state,l,enemy) for l in LANES}
-
-        # you can add custom lane logic here (e.g. counter specific players)
-
-        # INITIAL PICK (once per game)
-        if self._lane_tick==0:
-            avoid=set()
-            for b in all_bots:
-                if b.name!=self.name and b.faction==enemy: avoid.add(b.current_lane)
-            bot_lanes=set()
-            for b in all_bots:
-                if b.name!=self.name and b.faction==faction: bot_lanes.add(b.current_lane)
-            best,best_s=self.default_lane,-999
-            for lane in LANES:
-                if lane in avoid: continue
-                s=0
-                if lane in bot_lanes: s-=20
-                s-=lane_enemies.get(lane,0)*5
-                for t in state.get("towers",[]):
-                    if t["faction"]==faction and t["lane"]==lane and t.get("alive"): s+=15
-                if s>best_s: best_s=s; best=lane
-            self._lane_tick=tick; self.current_lane=best; return best
-
-        cur=self.current_lane
-        game_secs = tick / TICK_RATE
-        level = hero.get("level", 1)
-
-        # EMERGENCY: 1v4+ = certain death
-        cur_e=lane_enemies.get(cur,0); cur_a=self._count(state,cur,faction)
-        if cur_e>=cur_a+3:
-            for lane in LANES:
-                if lane!=cur and lane_enemies.get(lane,0)<2:
-                    self._lane_tick=tick; return lane
-
-        # === TOWER-PUSH STATE MACHINE ===
-        # Break zen mode ONLY for strategic tower snipes (one-time switch)
-
-        # Find enemy tower HP per lane
-        enemy_towers = {}
-        our_tower_count = 0
-        enemy_tower_count = 0
-        for t in state.get("towers", []):
-            if t["faction"] == enemy:
-                enemy_towers[t["lane"]] = t
-                if t.get("alive"): enemy_tower_count += 1
-            elif t["faction"] == faction and t.get("alive"):
-                our_tower_count += 1
-
-        # PHASE 1: PRE-RUSH RECALL (1:20-1:40, recall for full HP before tower buff expires)
-        if 80 < game_secs < 100 and hero.get("hp", 0) < hero.get("maxHp", 1) * 0.9:
-            # Don't switch lane, just flag for recall (handled in should_recall)
-            pass
-
-        # PHASE 2: TOWER SNIPE (any time after 1:45)
-        # If enemy tower < 400 HP, converge there (ONE switch, then stay)
-        if game_secs > 105 and level >= 5:
-            for lane in LANES:
-                t = enemy_towers.get(lane, {})
-                if t.get("alive") and t.get("hp", 1200) < 400 and lane != cur:
-                    # Only switch if we haven't switched recently (avoid shove spam)
-                    if tick - self._lane_tick > 60 * TICK_RATE:
-                        self._lane_tick = tick; return lane
-
-        # PHASE 3: DRAGON SETUP (2 enemy towers down, converge on 3rd)
-        if enemy_tower_count == 1 and level >= 8:
-            for lane in LANES:
-                t = enemy_towers.get(lane, {})
-                if t.get("alive") and lane != cur:
-                    if tick - self._lane_tick > 60 * TICK_RATE:
-                        self._lane_tick = tick; return lane
-
-        # PHASE 4: ENDGAME (after 12:00, converge for final push)
-        if game_secs > 720:
-            # Find lane closest to enemy base (fewest structures remaining)
-            push_lane = None
-            for lane in LANES:
-                t = enemy_towers.get(lane, {})
-                if not t.get("alive"):  # tower already down, push here
-                    push_lane = lane; break
-            if not push_lane:
-                # All towers up, pick weakest
-                weakest = min(enemy_towers.values(), key=lambda t: t.get("hp", 9999)) if enemy_towers else None
-                if weakest: push_lane = weakest.get("lane", "mid")
-            if push_lane and push_lane != cur and tick - self._lane_tick > 60 * TICK_RATE:
-                self._lane_tick = tick; return push_lane
-
-        # PHASE 5: SUDDEN DEATH (last 90s, all-in)
-        if tick > SUDDEN_DEATH_TICKS - 90 * TICK_RATE:
+        if tick > SUDDEN_DEATH_TICKS - 60 * TICK_RATE:
+            faction=self.faction or ""
             best = max(LANES, key=lambda l: self._count(state, l, faction))
-            if best != cur and tick - self._lane_tick > 30 * TICK_RATE:
-                self._lane_tick = tick; return best
+            if best != self.current_lane and self._lane_tick == 0:
+                self._lane_tick = tick
+                return best
 
-        # PASSIVE RL (data collection)
-        if self.rl and hero.get("alive"):
-            allies=self._count(state,cur,faction); enemies=lane_enemies.get(cur,0)
-            tower_alive=any(t["faction"]==faction and t["lane"]==cur and t.get("alive") for t in state.get("towers",[]))
-            kd=self.kills_est/max(self.deaths,1)
-            self.rl.decide_and_learn(hero,state,faction,cur,allies,enemies,tower_alive,kd,self._prev_hero,set())
-            self._prev_hero=dict(hero)
-        if self.brain:
-            xp=sum(200*i for i in range(1,level))+hero.get("xp",0)
-            self.brain.update_xp(cur,xp)
-
-        # DEFAULT: ZEN MODE (stay and farm)
-        return cur
-        return preferred[0] if preferred else self.default_lane
+        # ALWAYS return assigned lane. no dynamic picking. no switching.
+        return self.default_lane
 
     def should_recall(self, hero, state):
+        """Simple recall: 30% HP base, +10% per enemy hero in lane.
+        No brain, no adaptive, no complexity. Just math.
+        Production MOBA bots use 30% threshold. Top players stay at 40%.
+        """
         if hero.get("recallCooldownMs",0)>0 or not hero.get("alive"): return False
         mx=hero.get("maxHp",1)
         if mx<=0: return False
         hp_pct=hero.get("hp",0)/mx
-        tick=state.get("tick",0)
-        game_secs=tick/TICK_RATE
+        game_secs=state.get("tick",0)/TICK_RATE
 
-        # NEVER recall in last 2 minutes (sudden death = bases can't attack, commit)
+        # Never recall in last 2 min
         if game_secs > 780: return False
 
-        # PRE-RUSH RECALL: at 1:20-1:40, recall to full HP for tower buff expiry push
-        if 80 < game_secs < 100 and hp_pct < 0.9:
-            return True
-
+        # Count enemies in my lane
         faction=self.faction or ""; enemy="orc" if faction=="human" else "human"
         enemies=self._count(state,hero.get("lane",""),enemy)
-        if self.brain:
-            enemy_lvls=[h.get("level",1) for h in state.get("heroes",[]) if h.get("faction")==enemy and h.get("alive")]
-            enemy_avg=sum(enemy_lvls)/max(len(enemy_lvls),1)
-            return self.brain.should_recall(hero.get("level",1),enemy_avg,enemies,hp_pct,tick)
-        return hp_pct<0.70
+
+        # Simple threshold: 30% + 10% per enemy
+        threshold = 0.30 + enemies * 0.10
+        return hp_pct < threshold
 
     def tick(self, state, all_bots):
         if state.get("winner"):
             self.joined=False; self.kills_est=0; self.deaths=0; self.recalls=0; self._prev_xp=0
-            if self.brain: self.brain.reset_game()
-            self._prev_hero=None; return None
+            return None
 
         if not self.joined:
             r=api_post("/api/strategy/deployment",self.api_key,{"heroClass":self.hero_class,"heroLane":self.default_lane})
@@ -294,21 +195,13 @@ class Bot:
         if not hero: return None
 
         alive=hero.get("alive",False)
-        if self._prev_alive and not alive:
-            self.deaths+=1
-            if self.brain: self.brain.on_death(state.get("tick",0))
-        # DEATH ROTATION (from thebestpizza): respawn = free lane change
-        # Reset lane_tick so pick_lane recalculates optimal lane on respawn
-        if not self._prev_alive and alive:
-            self._lane_tick = 0  # triggers fresh lane pick on next cycle
+        if self._prev_alive and not alive: self.deaths+=1
         self._prev_alive=alive
 
         level=hero.get("level",1)
         xp=sum(200*i for i in range(1,level))+hero.get("xp",0)
         if self._prev_xp>0 and xp-self._prev_xp>=180:
-            nk=(xp-self._prev_xp)//180; self.kills_est+=nk
-            if self.brain:
-                for _ in range(nk): self.brain.on_kill()
+            self.kills_est+=(xp-self._prev_xp)//180
         self._prev_xp=xp
 
         if not alive: self.last_action="dead"; return None
@@ -384,7 +277,7 @@ class HordeApp(App):
         self.game_id=fleet.get("game",3)
         self.bots=[Bot(b,self.game_id) for b in fleet["bots"]]
         for bot in self.bots:
-            bot.brain=LearningBrain(); bot.rl=RLBrain()
+            pass  # no brain/rl, pure simple logic
         self.stats=Stats(); self.state={}; self.cycle=0
         self._last_winner=None; self._prev_heroes={}
 
@@ -429,8 +322,7 @@ class HordeApp(App):
             hb=sum(1 for b in self.bots if b.faction=="human")
             ob=sum(1 for b in self.bots if b.faction=="orc")
             for bot in self.bots:
-                if bot.brain: bot.brain.retrain()
-                if bot.rl: bot.rl.end_game(bot.faction==winner); bot.rl.reset_game()
+                pass  # no brain/rl to update
             self.call_from_thread(self._log,f"[bold]GAME OVER[/bold] {winner} wins ({hb}H/{ob}O)")
             self._last_winner=winner
         elif not winner: self._last_winner=None
