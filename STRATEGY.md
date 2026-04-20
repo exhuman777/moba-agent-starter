@@ -261,6 +261,63 @@ rich               # TUI rendering (dashboard only)
 
 No ML deps. Pure if/else strategy. The competitor `lmeow` bot we reverse-engineered is also pure if/else — that's not a coincidence; reaction speed and clean rules beat shallow ML in this game.
 
+## Game meta (worth knowing before tuning)
+
+These come from patch notes + community Discord, not the API. They directly affect strategy decisions.
+
+### AI Ranked ladder — Game 3 (Patch 1.13)
+
+**Game 3 is the dedicated AI bot ladder.** Bots have their own MMR + leaderboard. Top-ranked bots earn $DOTA at end of each season. Currently preseason (season 0), transitioning to season 1.
+
+Implication: every game your fleet plays in slot 3 counts toward MMR. Strategy improvements directly translate to $DOTA rewards. Pick game 3 as default.
+
+### MMR rules (Patch 1.14.1)
+
+- Games with <6 players now count for HALF MMR (was: zero MMR).
+- Most fleet matches have 10-20 heroes total → full MMR.
+
+### New ping types (Patch 1.14.1)
+
+- **Thumbs up** — social signal, probably cosmetic.
+- **Recall** — broadcasts your current recall CD to allies. Useful for coordinating disengages.
+
+Worth wiring into bots: emit a Recall ping when self-recalling so allies don't dive without their carry.
+
+### WebSocket action submission (community tip — Arcanum)
+
+The WebSocket isn't just for receiving state. Per Arcanum (Discord 2026-04-19): you can SUBMIT actions via the WS too. Most bots HTTP-POST every command via `/api/strategy/deployment` — these are subject to rate limits and add 50-200ms of latency per action. WS submission likely bypasses both.
+
+Implementation path: open the game in a browser, dive into the network tab, find the WS message format for actions. Mirror it from the controller. Untested in this codebase as of v28.
+
+### Build hint — "one of each gud ability" (AzFlin, Twitter 2026-04-19)
+
+Conventional build wisdom: spam one ability to L3 for max damage. AzFlin's contrarian build at L12: **L1 of every ability** (fortitude + fireball + tornado + raise_skeleton). Pairs with Ring of Regen NFT + $DOTA holder buff.
+
+Counter-intuitive but defensible — at L1 each ability gives a new tool; L2/L3 only give +25-35% effectiveness on a tool you already have. Breadth > depth for sustained-fight characters.
+
+Implementation:
+
+```python
+have_ids = {a["id"] for a in hero.get("abilities", [])}
+choices = hero.get("abilityChoices", [])
+pick = None
+# Phase 1: prefer a NEW ability over upgrading an existing one
+for a in self.ability_prio:
+    if a in choices and a not in have_ids:
+        pick = a; break
+# Phase 2: fall back to upgrade order
+if not pick:
+    for a in self.ability_prio:
+        if a in choices: pick = a; break
+```
+
+### Wallet items beyond skins
+
+`/api/wallet/connect` returns ownership flags for every NFT in the connected wallet:
+- `tokenHolder` — $DOTA holder buff (+10% HP/dmg, applies to all wallet-bound bots automatically).
+- `pixagreenMage`, `spaceMarine` — skins (1:1, server visually equips on one bot at a time).
+- `ringOfRegen` — HP regen item. Ownership shown by API; whether the server auto-applies it on deploy or needs an explicit payload field is **unverified**. Worth comparing HP regen rate of a wallet-connected bot vs an unconnected bot to confirm.
+
 ## Provenance / numbers
 
 Numbers from a 10-game test run (Apr 19 2026, mage fleet pre-strategy-v2):
