@@ -168,8 +168,10 @@ class TestAutoConnect(unittest.TestCase):
 # WSBot: init + deploy gates + shove-micro prevention
 # ---------------------------------------------------------------------------
 
-def _state_with_no_hero(tick=1000):
-    """Game state where our bot has not yet spawned (triggers deploy path)."""
+def _state_with_no_hero(tick=100):
+    """Game state where our bot has not yet spawned (triggers deploy path).
+    tick=100 keeps us under the fresh-game gate threshold (600).
+    """
     return {"tick": tick, "winner": None, "heroes": [], "towers": []}
 
 
@@ -864,6 +866,168 @@ class TestStrategyV2(unittest.TestCase):
         # The other code paths might also set it to 3000, so we just check the
         # bot didn't crash and no unexpected state mutation.
         self.assertTrue(True)
+
+
+# ---------------------------------------------------------------------------
+# WSBot strategy v3: fresh-game gate, death-streak filter, breadth-first ability
+# ---------------------------------------------------------------------------
+
+class TestStrategyV3(unittest.TestCase):
+    """v3 fixes (2026-04-20):
+       D. Fresh-game gate: don't deploy into a mid-game match (tick > 600)
+          unless we've seen a game-end since startup.
+       E. Death-streak filter: 3 consecutive dead ticks before counting a
+          death (eliminates WS flicker over-count).
+       F. Breadth-first ability picker (AzFlin "one of each gud ability"):
+          prefer NEW ability over upgrading any existing one.
+       G. Kill-execute override: force fireball when an enemy hero in lane
+          is below 30% HP and fireball is offered.
+    """
+
+    def _bot(self, **kw):
+        cfg = {"name": "B", "key": "k", "class": "mage", "lane": "top",
+               "style": "sigma", "ability_prio": ["fireball", "tornado", "fortitude", "fury"]}
+        cfg.update(kw)
+        return ws_runner.WSBot(cfg)
+
+    # ---- D: fresh-game gate ----
+
+    def test_gate_blocks_deploy_when_tick_high_and_no_game_over_seen(self):
+        bot = self._bot()
+        with patch.object(ws_runner, "api_post") as m:
+            bot.process({"tick": 8000, "winner": None, "heroes": [], "towers": []})
+        m.assert_not_called()
+        self.assertFalse(bot.joined)
+
+    def test_gate_allows_deploy_when_tick_low(self):
+        bot = self._bot()
+        with patch.object(ws_runner, "api_post", return_value={"gameId": 3}) as m:
+            bot.process({"tick": 100, "winner": None, "heroes": [], "towers": []})
+        m.assert_called_once()
+        self.assertTrue(bot.joined)
+
+    def test_gate_opens_after_seeing_game_over(self):
+        bot = self._bot()
+        # First message: game-over (sets _seen_game_over)
+        bot.process({"tick": 9000, "winner": "human", "heroes": [], "towers": []})
+        # Now even at high tick the bot will deploy (next game has begun)
+        with patch.object(ws_runner, "api_post", return_value={"gameId": 3}) as m:
+            bot.process({"tick": 8000, "winner": None, "heroes": [], "towers": []})
+        m.assert_called_once()
+        self.assertTrue(bot.joined)
+
+    # ---- E: death-streak filter ----
+
+    def _alive_state(self, alive, tick=100):
+        return {
+            "tick": tick, "winner": None, "towers": [],
+            "heroes": [{
+                "name": "B", "faction": "human", "lane": "top",
+                "alive": alive, "hp": 100 if alive else 0, "maxHp": 200,
+                "level": 5, "xp": 0,
+                "abilities": [], "abilityChoices": [], "recallCooldownMs": 0,
+            }],
+        }
+
+    def test_death_streak_filter_ignores_single_tick_flicker(self):
+        bot = self._bot()
+        bot.joined = True; bot.faction = "human"
+        bot._prev_xp_total = 100
+        with patch.object(ws_runner, "api_post", return_value={}):
+            bot.process(self._alive_state(True))
+            bot.process(self._alive_state(False, tick=120))   # 1 tick dead
+            bot.process(self._alive_state(True, tick=140))    # back alive — flicker
+        self.assertEqual(bot.deaths, 0, "single-tick alive=False should be ignored")
+
+    def test_death_counts_after_3_consecutive_dead_ticks(self):
+        bot = self._bot()
+        bot.joined = True; bot.faction = "human"
+        bot._prev_xp_total = 100
+        with patch.object(ws_runner, "api_post", return_value={}):
+            bot.process(self._alive_state(True, tick=100))
+            bot.process(self._alive_state(False, tick=120))
+            bot.process(self._alive_state(False, tick=140))
+            bot.process(self._alive_state(False, tick=160))   # 3rd consecutive
+        self.assertEqual(bot.deaths, 1)
+
+    def test_death_counts_only_once_per_streak(self):
+        """Stay dead for many ticks -> still only 1 death recorded until alive again."""
+        bot = self._bot()
+        bot.joined = True; bot.faction = "human"
+        bot._prev_xp_total = 100
+        with patch.object(ws_runner, "api_post", return_value={}):
+            bot.process(self._alive_state(True, tick=100))
+            for t in range(120, 600, 20):
+                bot.process(self._alive_state(False, tick=t))
+        self.assertEqual(bot.deaths, 1)
+
+    # ---- F: breadth-first ability + G: kill-execute ----
+
+    def _ability_state(self, choices, abilities=None, enemy_hp_pct=1.0, tick=200):
+        heroes = [{
+            "name": "B", "faction": "human", "lane": "top",
+            "alive": True, "hp": 200, "maxHp": 200, "level": 5, "xp": 0,
+            "abilities": abilities or [],
+            "abilityChoices": choices,
+            "recallCooldownMs": 0,
+        }]
+        if enemy_hp_pct < 1.0:
+            heroes.append({
+                "name": "Enemy", "faction": "orc", "lane": "top",
+                "alive": True, "hp": int(200 * enemy_hp_pct), "maxHp": 200,
+                "level": 5,
+            })
+        return {"tick": tick, "winner": None, "heroes": heroes, "towers": []}
+
+    def test_breadth_first_picks_NEW_ability_over_upgrading_existing(self):
+        """Bot already has fireball L1. Choices: [fireball (upgrade), tornado (new)].
+        Per AzFlin breadth-first: pick tornado, not fireball-L2."""
+        bot = self._bot()
+        bot.joined = True; bot.faction = "human"
+        bot._prev_xp_total = 100; bot._last_command_tick = 0
+        calls = []
+        with patch.object(ws_runner, "api_post", side_effect=lambda *a: calls.append(a)):
+            bot.process(self._ability_state(
+                choices=["fireball", "tornado"],
+                abilities=[{"id": "fireball", "level": 1}],
+            ))
+        ability_calls = [c[2].get("abilityChoice") for c in calls if c[2].get("abilityChoice")]
+        self.assertIn("tornado", ability_calls,
+                      f"should pick NEW (tornado) over upgrade (fireball); got {ability_calls}")
+
+    def test_breadth_first_falls_back_to_upgrade_when_no_new(self):
+        """All abilities owned. Pick by ability_prio order (fireball first)."""
+        bot = self._bot()
+        bot.joined = True; bot.faction = "human"
+        bot._prev_xp_total = 100; bot._last_command_tick = 0
+        calls = []
+        with patch.object(ws_runner, "api_post", side_effect=lambda *a: calls.append(a)):
+            bot.process(self._ability_state(
+                choices=["fireball", "tornado"],
+                abilities=[{"id": "fireball", "level": 1},
+                           {"id": "tornado", "level": 1}],
+            ))
+        ability_calls = [c[2].get("abilityChoice") for c in calls if c[2].get("abilityChoice")]
+        self.assertIn("fireball", ability_calls,
+                      f"both owned, should fall back to prio[0]=fireball; got {ability_calls}")
+
+    def test_kill_execute_override_picks_fireball_on_low_hp_enemy(self):
+        """Enemy hero in lane at <30% HP -> fireball wins regardless of breadth-first."""
+        bot = self._bot()
+        bot.joined = True; bot.faction = "human"
+        bot._prev_xp_total = 100; bot._last_command_tick = 0
+        calls = []
+        with patch.object(ws_runner, "api_post", side_effect=lambda *a: calls.append(a)):
+            # Bot already has fireball L1 — breadth-first would normally pick tornado.
+            # But enemy at 20% HP triggers kill-execute override -> fireball.
+            bot.process(self._ability_state(
+                choices=["fireball", "tornado"],
+                abilities=[{"id": "fireball", "level": 1}],
+                enemy_hp_pct=0.20,
+            ))
+        ability_calls = [c[2].get("abilityChoice") for c in calls if c[2].get("abilityChoice")]
+        self.assertIn("fireball", ability_calls,
+                      f"low-HP enemy + fireball offered -> kill-execute should fire; got {ability_calls}")
 
 
 # ---------------------------------------------------------------------------

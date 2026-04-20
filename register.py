@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Register your fleet — fresh agent names, optional wallet connect, write fleet.json.
+"""Register your fleet — v3 build with per-lane ability priorities.
 
-Edit NEW_BOTS below with your own names + lanes + style choices, then run.
-The script registers each name via /api/agents/register, optionally connects
-your wallet (reads wallet.key or WALLET_PK env var), and writes a populated
-fleet.json. ws_runner.py / dashboard.py read fleet.json on the next launch.
+Edit NEW_BOTS with your own names. Each bot has a lane-specific prio that
+matches what the controller's three-phase ability picker (kill-execute /
+breadth-first / upgrade-order) is tuned for:
+  - mid:   fireball-first (kill execution)
+  - top:   fortitude-first (attrition lane, survive longer)
+  - bot:   tornado-first (AoE pressure on solo lane)
+  - rotate: tornado-first (multi-lane fights)
+
+Order matters — the bot at index 0 registers + wallet-connects FIRST,
+which can matter for any first-come-first-served NFT equip behavior.
 
 Run:  python3 register.py
 """
@@ -18,39 +24,27 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 BASE = "https://wc2-agentic-dev-3o6un.ondigitalocean.app"
 FLEET = os.path.join(DIR, "fleet.json")
 
-# --- EDIT THIS LIST ---------------------------------------------------------
-# Names must be unique across the server. If you get a 409 on register,
-# pick different names. style options: "lmeow" (passive farm) or "sigma"
-# (field-aware lane switching — recommended). ability_prio is the upgrade
-# pick order: fireball-first works best for kill credit on mages.
 NEW_BOTS = [
-    {
-        "name": "MyBot_Top",   "class": "mage", "lane": "top", "role": "mage",
-        "style": "sigma",
-        "ability_prio": ["fireball", "tornado", "fortitude", "fury", "raise_skeleton"],
-        "wallet": True,
-        "skin": "pixagreen_mage",   # remove this line if you don't own the NFT
-    },
-    {
-        "name": "MyBot_Mid",   "class": "mage", "lane": "mid", "role": "mage",
-        "style": "sigma",
-        "ability_prio": ["fireball", "tornado", "fortitude", "fury", "raise_skeleton"],
-        "wallet": True,
-        "skin": "pixagreen_mage",
-    },
-    {
-        "name": "MyBot_Bot",   "class": "mage", "lane": "bot", "role": "mage",
-        "style": "sigma",
-        "ability_prio": ["fireball", "tornado", "fortitude", "fury", "raise_skeleton"],
-        "wallet": True,
-        "skin": "pixagreen_mage",
-        "rotate_lane": True,        # round-robin top->mid->bot across games
-    },
+    {"name": "MyBot_Carry", "class": "mage", "lane": "mid", "role": "mage",
+     "style": "sigma",
+     "ability_prio": ["fireball", "tornado", "fortitude", "fury", "raise_skeleton"],
+     "wallet": True, "skin": "pixagreen_mage"},
+    {"name": "MyBot_Top", "class": "mage", "lane": "top", "role": "mage",
+     "style": "sigma",
+     "ability_prio": ["fortitude", "fireball", "tornado", "fury", "raise_skeleton"],
+     "wallet": True, "skin": "pixagreen_mage"},
+    {"name": "MyBot_Bot", "class": "mage", "lane": "bot", "role": "mage",
+     "style": "sigma",
+     "ability_prio": ["tornado", "fireball", "fortitude", "fury", "raise_skeleton"],
+     "wallet": True, "skin": "pixagreen_mage"},
+    {"name": "MyBot_Rot", "class": "mage", "lane": "top", "role": "mage",
+     "style": "sigma",
+     "ability_prio": ["tornado", "fireball", "fortitude", "fury", "raise_skeleton"],
+     "wallet": True, "skin": "pixagreen_mage", "rotate_lane": True},
 ]
-# ---------------------------------------------------------------------------
 
 
-def register(name: str) -> str | None:
+def register(name):
     r = requests.post(f"{BASE}/api/agents/register",
                       json={"agentName": name}, timeout=10)
     if r.status_code == 201:
@@ -75,8 +69,8 @@ def main():
         except Exception:
             pass
 
-    print(f"Registering {len(NEW_BOTS)} agents...")
-    keys: list[str] = []
+    print(f"Registering {len(NEW_BOTS)} agents (index 0 first)...")
+    keys = []
     for b in NEW_BOTS:
         print(f"  register {b['name']}...")
         k = register(b["name"])
@@ -92,7 +86,7 @@ def main():
     from wallet import load_pk, connect_bot
     pk = load_pk()
     if not pk:
-        print("[!] No WALLET_PK or wallet.key found — skipping wallet connect.")
+        print("[!] No WALLET_PK / wallet.key — skipping wallet connect.")
     else:
         print("Connecting wallet to each agent...")
         for b in NEW_BOTS:
@@ -100,8 +94,9 @@ def main():
             if "error" in r:
                 print(f"  [!] {b['name']}: {r['error']}")
             else:
-                print(f"  {b['name']}: holder={r.get('tokenHolder')} "
-                      f"pixagreenMage={r.get('pixagreenMage')}")
+                perks = {k: v for k, v in r.items()
+                         if k not in ("message", "address", "tokenBalance")}
+                print(f"  {b['name']}: {perks}")
 
     if os.path.exists(FLEET):
         ts = datetime.now().strftime("%Y-%m-%dT%H%M%S")
@@ -115,13 +110,14 @@ def main():
         except Exception: pass
     new_fleet = {
         "game": old.get("game", 3),
-        "notes": "Generated by register.py",
+        "notes": "Generated by register.py — v3 4-bot squad with per-lane ability_prio",
         "bots": NEW_BOTS,
     }
     with open(FLEET, "w") as f:
         json.dump(new_fleet, f, indent=2)
     print(f"\nWrote new fleet.json. {len(NEW_BOTS)} bots configured.")
     print("\nNext: python3 dashboard.py")
+    print("(fresh-game gate in ws_runner waits for the next game-start before deploying)")
 
 
 if __name__ == "__main__":

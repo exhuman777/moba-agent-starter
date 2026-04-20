@@ -77,6 +77,14 @@ class WSBot:
         self._last_deploy_try = 0.0            # unix ts for retry throttle
         # Rolling HP window for burst-detection recall: ~2.5s @ 20Hz
         self._hp_hist: deque[tuple[int, float]] = deque(maxlen=50)
+        # Death-streak filter: WS state can flicker alive=False for 1 tick on
+        # respawn ack. Require 3 consecutive dead ticks before counting a death.
+        self._dead_streak = 0
+        self._death_recorded = False
+        # Fresh-game gate: don't parachute into a mid-game match on startup.
+        # Once we've seen a game-end (winner set), the gate is open forever
+        # because every subsequent deploy IS at the start of a new game.
+        self._seen_game_over = False
 
     def process(self, state):
         """Called every WebSocket tick (20x/sec). Only sends API calls when needed."""
@@ -85,6 +93,9 @@ class WSBot:
                 log.info(f"{self.name}: game over ({state['winner']})")
             self.joined = False
             self.kills = 0; self.deaths = 0
+            self._dead_streak = 0
+            self._death_recorded = False
+            self._seen_game_over = True   # opens the fresh-game deploy gate
             return
 
         # Find our hero
@@ -97,6 +108,14 @@ class WSBot:
 
         if not hero:
             if not self.joined:
+                # FRESH-GAME GATE: don't deploy into a mid-game match. If we
+                # boot at tick 8000 of an in-progress game, our L1 mages get
+                # paired vs L10+ enemies and feed. Wait for either:
+                #   (a) the current tick is low (game just started), OR
+                #   (b) we've seen a game-end since startup (next game is fresh)
+                tick_now = state.get("tick", 0)
+                if tick_now > 600 and not self._seen_game_over:
+                    return
                 # Throttle retries so a misbehaving deploy doesn't spam the
                 # server 20x/sec. 5s between attempts is ample.
                 now = time.time()
@@ -132,9 +151,18 @@ class WSBot:
         faction = self.faction or ""
         enemy = "orc" if faction == "human" else "human"
 
-        # Track deaths
-        if self._prev_alive and not alive:
-            self.deaths += 1
+        # Track deaths — DEATH-STREAK FILTER: WS state flickers alive=False
+        # for 1 tick on respawn ack, causing a stale 1-tick alive bot to be
+        # double/triple-counted. Require 3 consecutive dead ticks before
+        # counting a death; reset the latch when actually alive.
+        if alive:
+            self._dead_streak = 0
+            self._death_recorded = False
+        else:
+            self._dead_streak += 1
+            if self._dead_streak >= 3 and not self._death_recorded:
+                self.deaths += 1
+                self._death_recorded = True
         # Death rotation: on respawn, pick best lane (ONCE per death, 30s cooldown)
         if not self._prev_alive and alive and tick - self._last_switch_tick > 30 * TICK_RATE:
             lane_enemies = {}
@@ -229,18 +257,39 @@ class WSBot:
         payload = {}
         send = False
 
-        # 2. ABILITY: pick immediately when available
+        # 2. ABILITY pick — three-phase priority:
+        #    Phase 0: KILL-EXECUTE override — if any enemy hero in our lane is
+        #             below 30% HP and fireball is offered, force-pick fireball.
+        #             Stops Beta's "lots of damage, no kills" pattern.
+        #    Phase 1: BREADTH-FIRST (AzFlin dream build) — prefer an ability
+        #             we don't yet own at L1 over upgrading any existing one.
+        #             Per AzFlin: L1-of-each beats L3-of-one for sustained fights.
+        #    Phase 2: fall back to ability_prio upgrade order.
         choices = hero.get("abilityChoices", [])
         if choices:
             pick = None
-            for a in self.ability_prio:
-                if a in choices:
-                    pick = a; break
+            pick_reason = ""
+            have_ids = {a.get("id") for a in hero.get("abilities", []) if isinstance(a, dict)}
+            if "fireball" in choices:
+                enemies_low = [h for h in state.get("heroes", [])
+                               if h.get("faction") == enemy and h.get("lane") == lane
+                               and h.get("alive")
+                               and h.get("hp", 0) / max(h.get("maxHp", 1), 1) < 0.30]
+                if enemies_low:
+                    pick = "fireball"; pick_reason = "exec"
             if not pick:
-                pick = choices[0]
+                for a in self.ability_prio:
+                    if a in choices and a not in have_ids:
+                        pick = a; pick_reason = "new"; break
+            if not pick:
+                for a in self.ability_prio:
+                    if a in choices:
+                        pick = a; pick_reason = "upgrade"; break
+            if not pick:
+                pick = choices[0]; pick_reason = "fallback"
             payload["abilityChoice"] = pick
             send = True
-            log.info(f"{self.name}: ability {pick}")
+            log.info(f"{self.name}: ability {pick} [{pick_reason}]")
 
         # 3. PING: weak enemy tower
         for t in state.get("towers", []):
