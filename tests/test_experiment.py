@@ -1105,6 +1105,66 @@ class TestStrategyV3(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# v3.2 farm mode — opt-in early-game XP discipline
+# ---------------------------------------------------------------------------
+
+class TestFarmMode(unittest.TestCase):
+    """v3.2 farm mode — a feature-flagged proactive recall during early game.
+    When cfg['farm_mode_seconds'] > 0, a bot will recall on ANY enemy hero
+    entering its lane at <80% HP, during the first N seconds of the game.
+    Goal: guarantee L4 by 4 min by never trading in the opening window.
+    Default is 0 (OFF) so existing fleets are unaffected.
+    """
+
+    def _bot(self, farm_seconds=0):
+        cfg = {"name": "B", "key": "k", "class": "mage", "lane": "top",
+               "style": "sigma",
+               "ability_prio": ["fireball", "tornado", "fortitude", "fury"],
+               "farm_mode_seconds": farm_seconds}
+        return ws_runner.WSBot(cfg)
+
+    def _state(self, hp=200, max_hp=200, enemy_in_lane=True, tick=2000):
+        heroes = [{"name": "B", "faction": "human", "lane": "top",
+                   "alive": True, "hp": hp, "maxHp": max_hp,
+                   "level": 3, "xp": 0, "abilities": [],
+                   "abilityChoices": [], "recallCooldownMs": 0}]
+        if enemy_in_lane:
+            heroes.append({"name": "E", "faction": "orc", "lane": "top",
+                           "alive": True, "hp": 200, "maxHp": 200, "level": 3})
+        return {"tick": tick, "winner": None, "heroes": heroes, "towers": []}
+
+    def test_farm_mode_off_no_preemptive_recall(self):
+        """Default (farm_mode_seconds=0) — no new recall behavior."""
+        bot = self._bot(farm_seconds=0)
+        bot.joined = True; bot.faction = "human"; bot._prev_xp_total = 100
+        calls = []
+        with patch.object(ws_runner, "api_post", side_effect=lambda *a: calls.append(a)):
+            bot.process(self._state(hp=140, tick=1000))
+        recalls = [c for c in calls if len(c) > 2 and c[2].get("action") == "recall"]
+        self.assertEqual(recalls, [], "farm_mode=0 must not add recalls")
+
+    def test_farm_mode_on_recalls_preemptively(self):
+        """farm_mode_seconds=300 — recall on any enemy at <80% HP during first 300s."""
+        bot = self._bot(farm_seconds=300)
+        bot.joined = True; bot.faction = "human"; bot._prev_xp_total = 100
+        calls = []
+        with patch.object(ws_runner, "api_post", side_effect=lambda *a: calls.append(a)):
+            bot.process(self._state(hp=140, tick=2000))
+        recalls = [c for c in calls if len(c) > 2 and c[2].get("action") == "recall"]
+        self.assertEqual(len(recalls), 1, f"should recall; got calls={calls}")
+
+    def test_farm_mode_expires_after_window(self):
+        """After the farm_mode_seconds window passes, behavior reverts to normal."""
+        bot = self._bot(farm_seconds=300)
+        bot.joined = True; bot.faction = "human"; bot._prev_xp_total = 100
+        calls = []
+        with patch.object(ws_runner, "api_post", side_effect=lambda *a: calls.append(a)):
+            bot.process(self._state(hp=140, tick=8000))
+        recalls = [c for c in calls if len(c) > 2 and c[2].get("action") == "recall"]
+        self.assertEqual(recalls, [], f"past farm window must not preemptively recall; got {calls}")
+
+
+# ---------------------------------------------------------------------------
 # Dashboard.RunnerProcess: spawn + stop lifecycle
 # ---------------------------------------------------------------------------
 

@@ -67,6 +67,10 @@ class WSBot:
         self.wallet_skin_ok = cfg.get("wallet_skin_ok", True)
         self.wallet_holder = cfg.get("wallet_holder")
         self.ability_prio = cfg.get("ability_prio", ["tornado", "fortitude", "fireball", "fury"])
+        # Farm mode (v3.2, OPT-IN): when > 0, during the first N game-seconds
+        # the bot recalls on ANY enemy in lane at <80% HP, and skips sigma
+        # lane switching. Goal: safe XP accumulation in the first ~5 minutes.
+        self.farm_mode_seconds = int(cfg.get("farm_mode_seconds", 0))
         self.joined = False
         self.game_id: int | None = None        # server-assigned on deploy
         self.faction = None
@@ -239,6 +243,22 @@ class WSBot:
             log.info(f"{self.name}: RECALL {recall_reason}")
             return
 
+        # === FARM MODE — proactive early-game recall (v3.2, opt-in) ===
+        # When enabled and within the farm window, recall on ANY enemy in
+        # lane at <80% HP. Prioritizes safe XP over any trade. Feature flag
+        # default is 0 (OFF), so existing fleets see no behavior change.
+        if self.farm_mode_seconds > 0 and game_secs < self.farm_mode_seconds:
+            enemies_here = sum(1 for h in state.get("heroes", [])
+                               if h.get("faction") == enemy and h.get("lane") == lane
+                               and h.get("alive"))
+            if (enemies_here > 0 and hp_pct < 0.80 and recall_cd == 0
+                    and tick - self._last_recall_tick > 5 * TICK_RATE):
+                api_post("/api/strategy/deployment", self.key,
+                         {"action": "recall", "message": f"FARM-R {hp_pct:.0%}"})
+                self._last_recall_tick = tick
+                log.info(f"{self.name}: FARM-RECALL at {hp_pct:.0%} (t={game_secs:.0f}s)")
+                return
+
         # === ABILITY PICK — BYPASS THROTTLE + GUARDS ===
         # Pick FIRST and IMMEDIATELY when offered. Previously this was
         # downstream of the tower-dive guard + 20-tick throttle, which
@@ -305,8 +325,10 @@ class WSBot:
                 break
 
         # 4. SIGMA STYLE: field-aware lane switching (WebSocket advantage)
-        # Uses 20x/sec position data to understand battlefield in real-time
-        if self.style == "sigma" and game_secs > 120:
+        # Uses 20x/sec position data to understand battlefield in real-time.
+        # Paused during the farm window so the bot stays in its default lane.
+        if (self.style == "sigma" and game_secs > 120
+                and game_secs >= self.farm_mode_seconds):
             # Only switch every 90s (no shove spam)
             if tick - self._last_switch_tick > 90 * TICK_RATE:
                 # Count enemies and allies per lane
