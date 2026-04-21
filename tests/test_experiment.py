@@ -420,6 +420,8 @@ class TestRecordGameSchema(unittest.TestCase):
         r._ws_by_game = {}
         r._threads_by_game = {}
         r._stop = False
+        r._choices_cache = {}
+        r._last_choices_poll = {}
         return r
 
     def _state(self, winner="human", human_levels=(10, 12), orc_levels=(8, 9),
@@ -485,6 +487,78 @@ class TestRecordGameSchema(unittest.TestCase):
         self.assertEqual(g["majority_faction"], "orc")
         self.assertFalse(g["majority_won"])
         self.assertEqual(g["orc_bots"], 2)
+
+    def test_tied_split_counts_as_win_when_half_bots_won(self):
+        """2H/2O split: human wins -> 2 of our bots (the human side) won.
+        Under the old logic, majority defaults to 'orc' so majority_won=False.
+        That undercounted wins across ~47% of games. New logic: majority_won
+        is True iff at least half our bots ended the game on the winning side.
+        majority_faction should read 'tie' for 2/2 (neither human nor orc).
+        """
+        runner = self._build_runner([
+            {"name": "A", "key": "k", "class": "mage"},
+            {"name": "B", "key": "k", "class": "mage"},
+            {"name": "C", "key": "k", "class": "mage"},
+            {"name": "D", "key": "k", "class": "mage"},
+        ])
+        runner.bots[0].faction = "human"
+        runner.bots[1].faction = "human"
+        runner.bots[2].faction = "orc"
+        runner.bots[3].faction = "orc"
+        state = self._state(winner="human",
+                            human_levels=(10,), orc_levels=(10,))
+        runner._record_game("human", state, runner.bots, gid=3)
+
+        with open(self.stats_path) as f:
+            g = json.load(f)[0]
+        self.assertEqual(g["majority_faction"], "tie")
+        self.assertTrue(
+            g["majority_won"],
+            "2H/2O split where 2 of our bots won should be majority_won=True"
+        )
+        self.assertEqual(g["human_bots"], 2)
+        self.assertEqual(g["orc_bots"], 2)
+
+    def test_tied_split_still_wins_when_orc_takes_game(self):
+        """Mirror test: same 2H/2O split, but orc wins instead.
+        Still 2 of our bots won (the orc side) -> majority_won=True.
+        Confirms the fix is faction-symmetric."""
+        runner = self._build_runner([
+            {"name": "A", "key": "k", "class": "mage"},
+            {"name": "B", "key": "k", "class": "mage"},
+            {"name": "C", "key": "k", "class": "mage"},
+            {"name": "D", "key": "k", "class": "mage"},
+        ])
+        runner.bots[0].faction = "human"
+        runner.bots[1].faction = "human"
+        runner.bots[2].faction = "orc"
+        runner.bots[3].faction = "orc"
+        state = self._state(winner="orc")
+        runner._record_game("orc", state, runner.bots, gid=3)
+        with open(self.stats_path) as f:
+            g = json.load(f)[0]
+        self.assertEqual(g["majority_faction"], "tie")
+        self.assertTrue(g["majority_won"])
+
+    def test_minority_on_winning_side_still_loses(self):
+        """3H/1O split, orc wins -> only 1 of our bots won. 1 < half of 4.
+        This is a legitimate loss; majority_won must stay False."""
+        runner = self._build_runner([
+            {"name": "A", "key": "k", "class": "mage"},
+            {"name": "B", "key": "k", "class": "mage"},
+            {"name": "C", "key": "k", "class": "mage"},
+            {"name": "D", "key": "k", "class": "mage"},
+        ])
+        runner.bots[0].faction = "human"
+        runner.bots[1].faction = "human"
+        runner.bots[2].faction = "human"
+        runner.bots[3].faction = "orc"
+        state = self._state(winner="orc")
+        runner._record_game("orc", state, runner.bots, gid=3)
+        with open(self.stats_path) as f:
+            g = json.load(f)[0]
+        self.assertEqual(g["majority_faction"], "human")
+        self.assertFalse(g["majority_won"])
 
     def test_reload_fleet_config_picks_up_new_skin(self):
         """Live edit to fleet.json between games — ws_runner should apply

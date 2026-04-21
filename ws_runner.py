@@ -36,7 +36,13 @@ def api_post(path, key, payload):
         return {"error": str(e)[:60]}
 
 def is_our_bot(name):
-    return name.startswith("ExH") or name.startswith("ExHuman")
+    # Any bot naming convention we've used: ExH*, ExHuman*, EX_* (v3).
+    # If you add a new naming scheme, extend this prefix list.
+    return (
+        name.startswith("ExH")
+        or name.startswith("ExHuman")
+        or name.startswith("EX_")
+    )
 
 
 class WSBot:
@@ -233,10 +239,46 @@ class WSBot:
             log.info(f"{self.name}: RECALL {recall_reason}")
             return
 
+        # === ABILITY PICK — BYPASS THROTTLE + GUARDS ===
+        # Pick FIRST and IMMEDIATELY when offered. Previously this was
+        # downstream of the tower-dive guard + 20-tick throttle, which
+        # starved the picker during active fights — bots were leveling up
+        # but never spending their ability points (e.g. EX_1 at L8 with 1
+        # ability instead of 3-4). Picks are not lane commands; sending
+        # them on demand is fine for server load.
+        choices = hero.get("abilityChoices", [])
+        if choices:
+            pick = None
+            pick_reason = ""
+            have_ids = {a.get("id") for a in hero.get("abilities", []) if isinstance(a, dict)}
+            # Phase 0: KILL-EXECUTE override
+            if "fireball" in choices:
+                enemies_low = [h for h in state.get("heroes", [])
+                               if h.get("faction") == enemy and h.get("lane") == lane
+                               and h.get("alive")
+                               and h.get("hp", 0) / max(h.get("maxHp", 1), 1) < 0.30]
+                if enemies_low:
+                    pick = "fireball"; pick_reason = "exec"
+            # Phase 1: BREADTH-FIRST (AzFlin) — pick a NEW ability over an upgrade
+            if not pick:
+                for a in self.ability_prio:
+                    if a in choices and a not in have_ids:
+                        pick = a; pick_reason = "new"; break
+            # Phase 2: fall back to upgrade order
+            if not pick:
+                for a in self.ability_prio:
+                    if a in choices:
+                        pick = a; pick_reason = "upgrade"; break
+            if not pick:
+                pick = choices[0]; pick_reason = "fallback"
+            api_post("/api/strategy/deployment", self.key, {"abilityChoice": pick})
+            log.info(f"{self.name}: ability {pick} [{pick_reason}]")
+
         # === TOWER-DIVE GUARD ===
-        # Don't chase enemies under their own tower if we're not full HP.
-        # Detects: an alive enemy tower in our current lane + we'd be the
-        # one engaging at low HP. Forces a back-off (skip this command tick).
+        # Block lane/recall commands when chasing under enemy tower at low HP.
+        # Critical: DO NOT bump _last_command_tick here — that starved the
+        # ability picker for 20 ticks every time the guard fired, which was
+        # essentially constant during mid-lane combat.
         enemy_tower_alive = any(
             t.get("faction") == enemy and t.get("lane") == lane and t.get("alive")
             and t.get("hp", 0) > 200
@@ -245,9 +287,7 @@ class WSBot:
         enemies_near = sum(1 for h in state.get("heroes", [])
                            if h.get("faction") == enemy and h.get("lane") == lane and h.get("alive"))
         if enemy_tower_alive and enemies_near > 0 and hp_pct < 0.70:
-            # Don't issue any command this tick — let the bot drift back naturally.
-            self._last_command_tick = tick
-            return
+            return  # let the bot drift back naturally; ability already picked above
 
         # === REACT TO STATE (only send commands when needed) ===
         # Throttle: max 1 command per second (20 ticks) to avoid API spam
@@ -256,40 +296,6 @@ class WSBot:
 
         payload = {}
         send = False
-
-        # 2. ABILITY pick — three-phase priority:
-        #    Phase 0: KILL-EXECUTE override — if any enemy hero in our lane is
-        #             below 30% HP and fireball is offered, force-pick fireball.
-        #             Stops Beta's "lots of damage, no kills" pattern.
-        #    Phase 1: BREADTH-FIRST (AzFlin dream build) — prefer an ability
-        #             we don't yet own at L1 over upgrading any existing one.
-        #             Per AzFlin: L1-of-each beats L3-of-one for sustained fights.
-        #    Phase 2: fall back to ability_prio upgrade order.
-        choices = hero.get("abilityChoices", [])
-        if choices:
-            pick = None
-            pick_reason = ""
-            have_ids = {a.get("id") for a in hero.get("abilities", []) if isinstance(a, dict)}
-            if "fireball" in choices:
-                enemies_low = [h for h in state.get("heroes", [])
-                               if h.get("faction") == enemy and h.get("lane") == lane
-                               and h.get("alive")
-                               and h.get("hp", 0) / max(h.get("maxHp", 1), 1) < 0.30]
-                if enemies_low:
-                    pick = "fireball"; pick_reason = "exec"
-            if not pick:
-                for a in self.ability_prio:
-                    if a in choices and a not in have_ids:
-                        pick = a; pick_reason = "new"; break
-            if not pick:
-                for a in self.ability_prio:
-                    if a in choices:
-                        pick = a; pick_reason = "upgrade"; break
-            if not pick:
-                pick = choices[0]; pick_reason = "fallback"
-            payload["abilityChoice"] = pick
-            send = True
-            log.info(f"{self.name}: ability {pick} [{pick_reason}]")
 
         # 3. PING: weak enemy tower
         for t in state.get("towers", []):
@@ -408,6 +414,13 @@ class WSRunner:
         self._ws_by_game: dict[int, object] = {}
         self._threads_by_game: dict[int, threading.Thread] = {}
         self._stop = False
+        # REST-cache for abilityChoices. The WS unit array format changed in
+        # patch 1.14.1 — index 18 is now the skin string, and abilityChoices
+        # was dropped from WS entirely. Only REST /api/game/state returns it.
+        # We poll REST every 3s per game and inject the choices into the
+        # WS-parsed state so the picker can fire.
+        self._choices_cache: dict[tuple[int, str], list] = {}  # (gid, name) -> choices
+        self._last_choices_poll: dict[int, float] = {}         # gid -> unix ts
 
         log.info(f"WSRunner: {len(self.bots)} bots, default game={self.default_game}, idx={self.game_idx}")
         for b in self.bots:
@@ -497,6 +510,25 @@ class WSRunner:
             log.info(f"fleet reload: applied config changes to {changed}"
                      + (" (wallet re-checked)" if needs_wallet_recheck else ""))
 
+    def _refresh_choices_cache(self, gid: int) -> None:
+        """Poll REST for ability choices (WS payload dropped them in 1.14.1).
+        Cached for 3 seconds per game. Cheap — single HTTP GET per interval.
+        """
+        now = time.time()
+        if now - self._last_choices_poll.get(gid, 0) < 3.0:
+            return
+        self._last_choices_poll[gid] = now
+        try:
+            r = requests.get(f"{BASE}/api/game/state", params={"game": gid}, timeout=3)
+            if r.status_code != 200:
+                return
+            for h in r.json().get("heroes", []):
+                nm = h.get("name")
+                if nm and is_our_bot(nm):
+                    self._choices_cache[(gid, nm)] = h.get("abilityChoices", []) or []
+        except Exception:
+            pass
+
     def _on_message_for_game(self, gid: int, message):
         """Dispatch a message from game `gid` to bots assigned to that game."""
         try:
@@ -507,10 +539,17 @@ class WSRunner:
             return
 
         self.tick_count += 1
+        self._refresh_choices_cache(gid)
 
         state = self._parse_ws_state(data)
         if not state:
             return
+
+        # Inject REST-sourced ability choices into each of our heroes.
+        for h in state.get("heroes", []):
+            nm = h.get("name")
+            if nm and is_our_bot(nm):
+                h["abilityChoices"] = self._choices_cache.get((gid, nm), [])
 
         # A bot is "in this game" if it's already tagged for this gid, OR it's
         # post-game-reset (game_id=None) and this is the default game — that's
@@ -645,8 +684,22 @@ class WSRunner:
 
             h_bots = sum(1 for b in bots_in_game if b.faction == "human")
             o_bots = sum(1 for b in bots_in_game if b.faction == "orc")
-            majority = "human" if h_bots > o_bots else "orc"
-            majority_won = (winner == majority)
+            # Scoring fix (v3.1): the old rule was `majority = "human" if
+            # h_bots > o_bots else "orc"`, which defaulted 2/2 ties to orc
+            # and silently flipped half our 2/2 games to losses. 47% of v3
+            # games fall in 2/2 — this was a large systematic bias.
+            # New rule: `majority_won` is True iff at least half our bots
+            # ended on the winning side (`bots_won >= total_bots / 2`).
+            # Tied-split games now count as wins when half our fleet won.
+            if h_bots > o_bots:
+                majority = "human"
+            elif o_bots > h_bots:
+                majority = "orc"
+            else:
+                majority = "tie"
+            total_bots = len(bots_in_game)
+            bots_won = sum(1 for b in bots_in_game if b.faction == winner)
+            majority_won = (2 * bots_won >= total_bots) if total_bots else False
 
             heroes = state.get("heroes", [])
             h_levels = [h.get("level", 1) for h in heroes if h.get("faction") == "human"]
@@ -719,7 +772,10 @@ class WSRunner:
             on_close=on_close, on_open=on_open,
         )
         t = threading.Thread(
-            target=lambda: ws.run_forever(ping_interval=30, ping_timeout=10),
+            # 20/10 is tighter than the old 30/10. Overnight run saw 5+
+            # ping/pong timeouts; faster pings detect dead connections
+            # sooner so auto-respawn loses less state during blips.
+            target=lambda: ws.run_forever(ping_interval=20, ping_timeout=10),
             daemon=True, name=f"ws-game-{gid}",
         )
         self._ws_by_game[gid] = ws
